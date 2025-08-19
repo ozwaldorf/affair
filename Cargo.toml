@@ -1,0 +1,33 @@
+[package]
+name = "affair"
+version = "0.1.2"
+edition = "2021"
+authors = ["Parsa Ghadimi <parsa@fleek.xyz>"]
+description = "A Tokio-based worker abstraction layer."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fleek-network/lightning"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1.28", features = ["rt", "sync", "macros"] }
+futures = "0.3"
+async-trait = "0.1"
+crossbeam = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tokio = { version = "1.28", features = [
+  "rt",
+  "sync",
+  "macros",
+  "rt-multi-thread",
+  "time",
+] }
+
+[[bench]]
+name = "bench"
+harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
