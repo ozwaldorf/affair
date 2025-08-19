@@ -227,10 +227,10 @@ impl<Req> Display for RunError<Req> {
         match &self {
             RunError::FailedToEnqueueReq(_) => {
                 write!(f, "failed to enqueue a request.")
-            },
+            }
             RunError::FailedToGetResponse => {
                 write!(f, "failed to recv the response")
-            },
+            }
         }
     }
 }
@@ -240,6 +240,8 @@ pub struct Task<Req, Res> {
     /// Access to this field will be deprecated.
     pub request: Req,
     respond: Option<oneshot::Sender<Res>>,
+    #[cfg(feature = "tracing")]
+    span: tracing::Span,
 }
 
 impl<Req, Res> Task<Req, Res> {
@@ -250,6 +252,7 @@ impl<Req, Res> Task<Req, Res> {
         Task {
             request: (),
             respond: self.respond.take(),
+            span: self.span.clone(),
         }
     }
 
@@ -268,8 +271,14 @@ impl<Req, Res> Task<Req, Res> {
         F: FnOnce(Req) -> Res,
     {
         let responder = self.split_to_responder();
+        #[cfg(feature = "tracing")]
+        let handle = self.span.enter();
+
         let response = handler(self.request);
         responder.respond(response);
+
+        #[cfg(feature = "tracing")]
+        drop(handle);
     }
 
     /// Handle the task from within the provided async closure.
@@ -280,7 +289,16 @@ impl<Req, Res> Task<Req, Res> {
         Fut: Future<Output = Res>,
     {
         let responder = self.split_to_responder();
+
+        #[cfg(not(feature = "tracing"))]
         let response = handler(self.request).await;
+
+        #[cfg(feature = "tracing")]
+        let response = {
+            use tracing::Instrument;
+            handler(self.request).instrument(self.span).await
+        };
+
         responder.respond(response);
     }
 }
@@ -366,6 +384,8 @@ impl<Req, Res> Socket<Req, Res> {
         let event = Task {
             request,
             respond: None,
+            #[cfg(feature = "tracing")]
+            span: tracing::Span::current(),
         };
 
         self.sender
@@ -381,6 +401,8 @@ impl<Req, Res> Socket<Req, Res> {
         let event = Task {
             request,
             respond: Some(tx),
+            #[cfg(feature = "tracing")]
+            span: tracing::Span::current(),
         };
 
         self.sender
@@ -459,5 +481,90 @@ mod tests {
         assert_eq!(res.unwrap(), 0);
         let res = socket.run(1).await;
         assert_eq!(res.unwrap(), 1);
+    }
+
+    #[cfg(feature = "tracing")]
+    #[tokio::test]
+    async fn test_tracing() {
+        use std::{env::temp_dir, fs::File};
+
+        #[derive(Default)]
+        struct TracedWorker {}
+        impl TracedWorker {
+            fn test(&self) {
+                // Log the message
+                tracing::info!("test from inside worker");
+            }
+        }
+        impl Worker for TracedWorker {
+            type Request = ();
+            type Response = ();
+            #[tracing::instrument(name = "child" skip_all)]
+            fn handle(&mut self, _req: Self::Request) -> Self::Response {
+                self.test()
+            }
+        }
+        impl AsyncWorker for TracedWorker {
+            type Request = ();
+            type Response = ();
+            #[tracing::instrument(name = "child" skip_all)]
+            async fn handle(&mut self, _req: Self::Request) -> Self::Response {
+                self.test()
+            }
+        }
+        impl AsyncWorkerUnordered for TracedWorker {
+            type Request = ();
+            type Response = ();
+            #[tracing::instrument(name = "child" skip_all)]
+            async fn handle(&self, _req: Self::Request) -> Self::Response {
+                self.test()
+            }
+        }
+
+        // Setup subscriber with file output so we can check it after
+        let path = temp_dir().join("affair_tracing_test_output");
+        tracing_subscriber::fmt()
+            .with_writer(
+                File::options()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap(),
+            )
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .compact()
+            .init();
+
+        /// Simple function that wraps a socket call inside a span
+        #[tracing::instrument(name = "parent", skip(socket))]
+        async fn test_socket_with_parent_span(socket: Socket<(), ()>, variant: &'static str) {
+            tracing::info!("test from inside parent");
+            socket.run(()).await.unwrap();
+        }
+
+        // Create a worker for each variant and test the span inheritance
+        let socket = Worker::spawn(TracedWorker::default());
+        test_socket_with_parent_span(socket, "sync socket").await;
+        let async_socket = AsyncWorker::spawn(TracedWorker::default());
+        test_socket_with_parent_span(async_socket, "async socket").await;
+        let unordered_socket = AsyncWorkerUnordered::spawn(TracedWorker::default());
+        test_socket_with_parent_span(unordered_socket, "unordered socket").await;
+
+        // Check output is expected
+        let output = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            output.trim_end().split("\n").collect::<Vec<_>>(),
+            vec![
+                r#" INFO parent: test from inside parent variant="sync socket""#,
+                r#" INFO parent:child: test from inside worker variant="sync socket""#,
+                r#" INFO parent: test from inside parent variant="async socket""#,
+                r#" INFO parent:child: test from inside worker variant="async socket""#,
+                r#" INFO parent: test from inside parent variant="unordered socket""#,
+                r#" INFO parent:child: test from inside worker variant="unordered socket""#
+            ]
+        );
     }
 }
